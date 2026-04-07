@@ -1,0 +1,30 @@
+[package]
+name = "claude-resume"
+version = "0.3.0"
+edition = "2021"
+description = "Session finder for Claude Code — search, browse, and resume conversations"
+license = "MIT"
+
+[[bin]]
+name = "claude-resume"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+chrono = "0.4"
+dirs = "6"
+nucleo-matcher = "0.3"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
