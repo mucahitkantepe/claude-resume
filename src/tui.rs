@@ -1,4 +1,4 @@
-use crate::index::{self, IndexEntry};
+use crate::index::{self, IndexEntry, SearchMode};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
@@ -31,6 +31,8 @@ struct App {
     preview_scroll: u16,
     quit: bool,
     chosen: Option<usize>,
+    search_mode: SearchMode,
+    status_msg: Option<String>,
     // Cache: (entry_index, query) -> preview lines
     preview_cache: Option<(usize, String, Vec<Line<'static>>)>,
 }
@@ -46,8 +48,37 @@ impl App {
             preview_scroll: 0,
             quit: false,
             chosen: None,
+            search_mode: SearchMode::Fuzzy,
+            status_msg: None,
             preview_cache: None,
         }
+    }
+
+    fn cycle_search_mode(&mut self) {
+        self.search_mode = self.search_mode.next();
+        self.status_msg = None;
+
+        if self.search_mode == SearchMode::Semantic {
+            let db = index::db_path();
+            let has_model = if let Ok(conn) = rusqlite::Connection::open(&db) {
+                conn.query_row(
+                    "SELECT count(*) FROM sessions WHERE embedding IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                    > 0
+            } else {
+                false
+            };
+
+            if !has_model {
+                self.status_msg = Some(
+                    "No embeddings found. Run `claude-resume embed` to download the model (~133MB) and enable semantic search.".to_string()
+                );
+            }
+        }
+        self.filter();
     }
 
     fn ensure_preview_cached(&mut self) {
@@ -73,71 +104,22 @@ impl App {
         if self.query.is_empty() {
             self.filtered = (0..self.entries.len()).collect();
         } else {
-            let mut matcher = Matcher::new(Config::DEFAULT);
-            let pattern = Pattern::new(
-                &self.query,
-                CaseMatching::Ignore,
-                Normalization::Smart,
-                AtomKind::Fuzzy,
-            );
-            let q_lower = self.query.to_lowercase();
-
-            const BONUS_SHORT: u32 = 1000;
-            const BONUS_CONTENT_EXACT: u32 = 500;
-            const BONUS_CONTENT_NEAR: u32 = 400;
-            let min_fuzzy_score = (self.query.chars().count() as u32) * 16;
-
-            // Pre-compute near-match variants (drop each char once for 1-edit tolerance)
-            let query_chars: Vec<(usize, char)> = self.query.char_indices().collect();
-            let near_variants: Vec<String> = if query_chars.len() >= 5 {
-                query_chars
-                    .iter()
-                    .map(|&(byte_idx, ch)| {
-                        let mut v = self.query.clone();
-                        v.replace_range(byte_idx..byte_idx + ch.len_utf8(), "");
-                        v.to_lowercase()
-                    })
-                    .collect()
-            } else {
-                Vec::new()
+            self.filtered = match self.search_mode {
+                SearchMode::Exact => index::search_exact(&self.entries, &self.query),
+                SearchMode::Fuzzy => index::search_fuzzy(&self.entries, &self.query),
+                SearchMode::Semantic => {
+                    let sids = index::search_semantic(&self.query);
+                    let sid_to_idx: std::collections::HashMap<&str, usize> = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (e.sid.as_str(), i))
+                        .collect();
+                    sids.iter()
+                        .filter_map(|sid| sid_to_idx.get(sid.as_str()).copied())
+                        .collect()
+                }
             };
-
-            let mut scored: Vec<(usize, u32)> = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(i, e)| {
-                    // Tier 1: fuzzy on short visible fields (high threshold)
-                    let short = format!("{} {} {}", e.label, e.project, e.branch);
-                    let mut buf = Vec::new();
-                    let haystack = Utf32Str::new(&short, &mut buf);
-                    if let Some(score) = pattern.score(haystack, &mut matcher) {
-                        if score >= min_fuzzy_score {
-                            return Some((i, score + BONUS_SHORT));
-                        }
-                    }
-
-                    let content_lower = e.search_text.to_lowercase();
-
-                    // Tier 2: exact substring on content
-                    if content_lower.contains(&q_lower) {
-                        return Some((i, BONUS_CONTENT_EXACT));
-                    }
-
-                    // Tier 3: near-match on content (1-edit distance tolerance)
-                    for variant in &near_variants {
-                        if content_lower.contains(variant.as_str()) {
-                            return Some((i, BONUS_CONTENT_NEAR));
-                        }
-                    }
-
-                    None
-                })
-                .collect();
-
-            // Sort by score descending (fuzzy matches on top, content matches below)
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
-            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         }
         self.selected = 0;
         self.preview_scroll = 0;
@@ -540,8 +522,9 @@ pub fn run(entries: Vec<IndexEntry>) -> io::Result<Option<IndexEntry>> {
                     }
                     break;
                 }
-                KeyCode::Up | KeyCode::BackTab => app.move_up(),
+                KeyCode::Up => app.move_up(),
                 KeyCode::Down | KeyCode::Tab => app.move_down(),
+                KeyCode::BackTab => app.cycle_search_mode(),
                 KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.move_up()
                 }
@@ -665,8 +648,9 @@ fn ui(f: &mut Frame, app: &App, preview_lines: Option<&[Line<'static>]>) {
 
     // ── Search input ──
     let match_info = format!("{}/{}", app.filtered.len(), app.entries.len());
+    let mode_label = app.search_mode.label();
     if compact {
-        let text = format!("> {} │ {}", app.query, match_info);
+        let text = format!("> {} │ {} │ {}", app.query, match_info, mode_label);
         let input = Paragraph::new(Span::styled(text, Style::default().fg(Theme::PRIMARY)));
         f.set_cursor_position((
             left_chunks[0].x + 2 + app.query.len() as u16,
@@ -678,7 +662,7 @@ fn ui(f: &mut Frame, app: &App, preview_lines: Option<&[Line<'static>]>) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Theme::BORDER_ACTIVE))
-                .title(format!(" claude-resume ({}) ", match_info)),
+                .title(format!(" {} ({}) ", mode_label, match_info)),
         );
         f.set_cursor_position((
             left_chunks[0].x + app.query.len() as u16 + 1,
@@ -784,7 +768,10 @@ fn ui(f: &mut Frame, app: &App, preview_lines: Option<&[Line<'static>]>) {
             Span::styled(" navigate ", Style::default().fg(Theme::MUTED)),
             Span::styled("│", Style::default().fg(Theme::MUTED)),
             Span::styled(" ^u/^d", Style::default().fg(Theme::PRIMARY).add_modifier(Modifier::BOLD)),
-            Span::styled(" scroll preview", Style::default().fg(Theme::MUTED)),
+            Span::styled(" scroll ", Style::default().fg(Theme::MUTED)),
+            Span::styled("│", Style::default().fg(Theme::MUTED)),
+            Span::styled(" ⇧tab", Style::default().fg(Theme::PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {} ", mode_label), Style::default().fg(Theme::ACCENT)),
         ]);
         let status = Paragraph::new(hints);
         f.render_widget(status, left_chunks[status_idx]);
@@ -804,7 +791,11 @@ fn ui(f: &mut Frame, app: &App, preview_lines: Option<&[Line<'static>]>) {
                 .scroll((app.preview_scroll, 0));
             f.render_widget(preview, main_chunks[1]);
         } else {
-            let empty = Paragraph::new(" No sessions found")
+            let msg = app
+                .status_msg
+                .as_deref()
+                .unwrap_or("No sessions found");
+            let empty = Paragraph::new(format!(" {}", msg))
                 .block(preview_block)
                 .style(Style::default().fg(Theme::MUTED));
             f.render_widget(empty, main_chunks[1]);

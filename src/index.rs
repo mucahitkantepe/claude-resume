@@ -17,6 +17,31 @@ pub fn claude_projects_dir() -> PathBuf {
         .join("projects")
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum SearchMode {
+    Exact,
+    Fuzzy,
+    Semantic,
+}
+
+impl SearchMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SearchMode::Exact => "exact",
+            SearchMode::Fuzzy => "fuzzy",
+            SearchMode::Semantic => "semantic",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            SearchMode::Exact => SearchMode::Fuzzy,
+            SearchMode::Fuzzy => SearchMode::Semantic,
+            SearchMode::Semantic => SearchMode::Exact,
+        }
+    }
+}
+
 /// An indexed session entry.
 #[derive(Clone)]
 pub struct IndexEntry {
@@ -92,6 +117,8 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         END;
         ",
     )?;
+    // Add embedding column if it doesn't exist
+    conn.execute_batch("ALTER TABLE sessions ADD COLUMN embedding BLOB;").ok();
     Ok(())
 }
 
@@ -274,18 +301,31 @@ pub fn load_index() -> Vec<IndexEntry> {
     .collect()
 }
 
-/// Search entries using FTS5 for content + fuzzy on short fields via nucleo.
-pub fn search_entries(entries: &[IndexEntry], query: &str) -> Vec<IndexEntry> {
+/// Exact substring search on all fields.
+pub fn search_exact(entries: &[IndexEntry], query: &str) -> Vec<usize> {
+    let q_lower = query.to_lowercase();
+    let results: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e.label.to_lowercase().contains(&q_lower)
+                || e.project.to_lowercase().contains(&q_lower)
+                || e.branch.to_lowercase().contains(&q_lower)
+                || e.search_text.to_lowercase().contains(&q_lower)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    // Keep original order (most recent first)
+    results
+}
+
+/// Fuzzy search: nucleo on labels + near-match on content.
+pub fn search_fuzzy(entries: &[IndexEntry], query: &str) -> Vec<usize> {
     use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
     use nucleo_matcher::{Config, Matcher, Utf32Str};
 
     let mut matcher = Matcher::new(Config::DEFAULT);
-    let pattern = Pattern::new(
-        query,
-        CaseMatching::Ignore,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-    );
+    let pattern = Pattern::new(query, CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy);
     let q_lower = query.to_lowercase();
     let query_chars: Vec<(usize, char)> = query.char_indices().collect();
     let min_fuzzy_score = (query_chars.len() as u32) * 16;
@@ -307,24 +347,25 @@ pub fn search_entries(entries: &[IndexEntry], query: &str) -> Vec<IndexEntry> {
         Vec::new()
     };
 
-    let mut scored: Vec<(&IndexEntry, u32)> = entries
+    let mut scored: Vec<(usize, u32)> = entries
         .iter()
-        .filter_map(|e| {
+        .enumerate()
+        .filter_map(|(i, e)| {
             let short = format!("{} {} {}", e.label, e.project, e.branch);
             let mut buf = Vec::new();
             let haystack = Utf32Str::new(&short, &mut buf);
             if let Some(score) = pattern.score(haystack, &mut matcher) {
                 if score >= min_fuzzy_score {
-                    return Some((e, score + BONUS_SHORT));
+                    return Some((i, score + BONUS_SHORT));
                 }
             }
             let content_lower = e.search_text.to_lowercase();
             if content_lower.contains(&q_lower) {
-                return Some((e, BONUS_CONTENT));
+                return Some((i, BONUS_CONTENT));
             }
             for variant in &near_variants {
                 if content_lower.contains(variant.as_str()) {
-                    return Some((e, BONUS_NEAR));
+                    return Some((i, BONUS_NEAR));
                 }
             }
             None
@@ -332,7 +373,149 @@ pub fn search_entries(entries: &[IndexEntry], query: &str) -> Vec<IndexEntry> {
         .collect();
 
     scored.sort_by(|a, b| b.1.cmp(&a.1));
-    scored.into_iter().map(|(e, _)| e.clone()).collect()
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
+/// Semantic search via embeddings + cosine similarity.
+pub fn search_semantic(query: &str) -> Vec<String> {
+    use crate::embedder;
+
+    let embedder = match embedder::get_or_init_embedder() {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+
+    let query_emb = match embedder.embed_query(query) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let db = db_path();
+    let conn = match Connection::open(&db) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut stmt = match conn.prepare("SELECT sid, embedding FROM sessions WHERE embedding IS NOT NULL") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut scored: Vec<(String, f32)> = stmt
+        .query_map([], |row| {
+            let sid: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((sid, blob))
+        })
+        .unwrap_or_else(|_| panic!("query failed"))
+        .flatten()
+        .map(|(sid, blob)| {
+            let emb = embedder::blob_to_embedding(&blob);
+            let score = embedder::cosine_similarity(&query_emb, &emb);
+            (sid, score)
+        })
+        .filter(|(_, score)| *score > 0.5) // minimum similarity threshold
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(100);
+    scored.into_iter().map(|(sid, _)| sid).collect()
+}
+
+/// Generate embeddings for all sessions missing them.
+pub fn embed_all() {
+    use crate::embedder;
+
+    let embedder = match embedder::get_or_init_embedder() {
+        Some(e) => e,
+        None => return,
+    };
+
+    let db = db_path();
+    let conn = match Connection::open(&db) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let mut stmt = conn
+        .prepare("SELECT sid, label FROM sessions WHERE embedding IS NULL")
+        .expect("prepare failed");
+    let sessions: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .flatten()
+        .collect();
+
+    if sessions.is_empty() {
+        eprintln!("All sessions already have embeddings.");
+        return;
+    }
+
+    eprintln!("Generating embeddings for {} sessions...", sessions.len());
+    let mut done = 0;
+    for (sid, text) in &sessions {
+        if text.len() < 10 { continue; }
+        // Embed label + user prompts only (not tool output/code noise)
+        let embed_input = build_embed_text(sid, &text);
+        match embedder.embed_session(&embed_input) {
+            Ok(emb) => {
+                let blob = embedder::embedding_to_blob(&emb);
+                conn.execute(
+                    "UPDATE sessions SET embedding = ?1 WHERE sid = ?2",
+                    params![blob, sid],
+                ).ok();
+                done += 1;
+                if done % 10 == 0 {
+                    eprint!("\r  {}/{}", done, sessions.len());
+                }
+            }
+            Err(e) => {
+                eprintln!("\n  Failed {}: {}", &sid[..8], e);
+            }
+        }
+    }
+    eprintln!("\r  {}/{} done.", done, sessions.len());
+}
+
+/// Build text for embedding: label + user prompts (excludes tool output noise).
+fn build_embed_text(sid: &str, label: &str) -> String {
+    let mut parts = vec![label.to_string()];
+
+    if let Some(path) = find_session_file(sid) {
+        if let Ok(file) = std::fs::File::open(&path) {
+            let reader = std::io::BufReader::new(file);
+            use std::io::BufRead;
+            let mut count = 0;
+            for line in reader.lines().flatten() {
+                if line.len() > 50_000 { continue; }
+                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if entry.get("type").and_then(|v| v.as_str()) == Some("user") {
+                        if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
+                            let text = if let Some(s) = content.as_str() {
+                                s.to_string()
+                            } else if let Some(arr) = content.as_array() {
+                                arr.iter()
+                                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+                                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            } else {
+                                continue;
+                            };
+                            if !text.starts_with("<local-command") && !text.starts_with("<command-name>") {
+                                let short: String = text.chars().take(500).collect();
+                                parts.push(short);
+                                count += 1;
+                                if count >= 30 { break; } // first 30 user prompts
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    parts.join(" ")
 }
 
 /// Snap a byte index to the nearest valid char boundary (backward).
@@ -515,27 +698,27 @@ mod tests {
             entry("unrelated", "other", "", "nothing"),
             entry("session", "proj", "", "implemented karabasan engine"),
         ];
-        let r = search_entries(&entries, "karabasan");
+        let r = search_fuzzy(&entries, "karabasan");
         assert_eq!(r.len(), 1);
-        assert!(r[0].search_text.contains("karabasan"));
+        assert!(entries[r[0]].search_text.contains("karabasan"));
     }
 
     #[test]
     fn search_fuzzy_label() {
         let entries = vec![entry("karabasan dev", "game", "", "content")];
-        assert_eq!(search_entries(&entries, "karabasan").len(), 1);
+        assert_eq!(search_fuzzy(&entries, "karabasan").len(), 1);
     }
 
     #[test]
     fn search_no_match() {
         let entries = vec![entry("hello", "test", "", "nothing")];
-        assert!(search_entries(&entries, "karabasan").is_empty());
+        assert!(search_fuzzy(&entries, "karabasan").is_empty());
     }
 
     #[test]
     fn search_near_match() {
         let entries = vec![entry("s", "p", "", "implemented karabasan engine")];
-        assert!(!search_entries(&entries, "karabasn").is_empty());
+        assert!(!search_fuzzy(&entries, "karabasn").is_empty());
     }
 
     #[test]

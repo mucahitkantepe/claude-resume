@@ -1,6 +1,6 @@
 {
   "name": "claude-resume",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Search and resume past Claude Code sessions.",
   "author": {
     "name": "mucahitkantepe"

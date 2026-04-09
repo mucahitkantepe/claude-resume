@@ -1,3 +1,4 @@
+mod embedder;
 mod index;
 mod install;
 mod parser;
@@ -25,11 +26,16 @@ enum Commands {
         /// Maximum results
         #[arg(short = 'n', long, default_value = "10")]
         max: usize,
+        /// Search mode: exact, fuzzy (default), semantic
+        #[arg(short = 'm', long, default_value = "fuzzy")]
+        mode: String,
     },
     /// Configure Claude Code settings (cleanupPeriodDays, hooks)
     Init,
     /// Remove hooks and index
     Uninstall,
+    /// Generate embeddings for semantic search (downloads model on first run)
+    Embed,
     /// Sync index (used internally by SessionStart hook)
     #[command(hide = true)]
     Sync,
@@ -40,9 +46,10 @@ fn main() {
 
     match cli.command {
         None => interactive(cli.force),
-        Some(Commands::Search { query, max }) => cmd_search(&query, max),
+        Some(Commands::Search { query, max, mode }) => cmd_search(&query, max, &mode),
         Some(Commands::Init) => cmd_init(),
         Some(Commands::Uninstall) => cmd_uninstall(),
+        Some(Commands::Embed) => cmd_embed(),
         Some(Commands::Sync) => index::sync(false),
     }
 }
@@ -89,12 +96,28 @@ fn interactive(force: bool) {
 }
 
 /// Non-interactive search (for plugin skill).
-fn cmd_search(query: &str, max: usize) {
+fn cmd_search(query: &str, max: usize, mode: &str) {
     if std::env::var("CLAUDE_RESUME_NO_SYNC").is_err() {
         index::sync(false);
     }
     let entries = index::load_index();
-    let matches = index::search_entries(&entries, query);
+
+    let match_indices = match mode {
+        "exact" => index::search_exact(&entries, query),
+        "semantic" => {
+            let sids = index::search_semantic(query);
+            let sid_to_idx: std::collections::HashMap<&str, usize> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (e.sid.as_str(), i))
+                .collect();
+            sids.iter()
+                .filter_map(|sid| sid_to_idx.get(sid.as_str()).copied())
+                .collect()
+        }
+        _ => index::search_fuzzy(&entries, query),
+    };
+    let matches: Vec<&index::IndexEntry> = match_indices.iter().map(|&i| &entries[i]).collect();
 
     if matches.is_empty() {
         println!("No sessions found matching \"{}\"", query);
@@ -139,6 +162,30 @@ fn cmd_search(query: &str, max: usize) {
     if matches.len() > count {
         println!("  ... and {} more", matches.len() - count);
     }
+}
+
+fn cmd_embed() {
+    if std::env::var("CLAUDE_RESUME_NO_SYNC").is_err() {
+        index::sync(false);
+    }
+
+    if !embedder::is_model_downloaded() {
+        eprintln!("Semantic search requires the bge-small-en-v1.5 embedding model.");
+        eprintln!("  Model: BAAI/bge-small-en-v1.5 (384 dimensions)");
+        eprintln!("  Size:  ~133MB download, stored in ~/.claude/models/");
+        eprintln!("  Runs:  fully local, no API calls after download");
+        eprintln!();
+        eprint!("Download and generate embeddings? [y/N] ");
+
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() || !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("Cancelled.");
+            return;
+        }
+        eprintln!();
+    }
+
+    index::embed_all();
 }
 
 fn cmd_init() {
