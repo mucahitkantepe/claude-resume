@@ -1,67 +1,88 @@
 #!/usr/bin/env sh
-# install.sh — zero-dependency installer for recall
-# Usage: curl -fsSL https://raw.githubusercontent.com/mucahitkantepe/claude-recall/main/install.sh | sh
-set -e
+# Install claude-resume: download the release binary for this machine and configure Claude Code.
+#
+#   curl -fsSL https://raw.githubusercontent.com/mucahitkantepe/claude-resume/master/install.sh | sh
+#
+# Environment:
+#   CLAUDE_RESUME_VERSION      release tag to install, e.g. v0.5.0 (default: the latest release)
+#   CLAUDE_RESUME_INSTALL_DIR  where to put the binary (default: ~/.local/bin)
+#   CLAUDE_RESUME_NO_INIT=1    only install the binary; leave Claude Code's settings alone
+set -eu
 
 REPO="mucahitkantepe/claude-resume"
 BIN_NAME="claude-resume"
-INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_DIR="${CLAUDE_RESUME_INSTALL_DIR:-$HOME/.local/bin}"
+VERSION="${CLAUDE_RESUME_VERSION:-latest}"
 
-# ── Detect platform ──────────────────────────────────────────────────────────
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-ARCH=$(uname -m)
-
-case "$OS" in
-  darwin) OS="apple-darwin" ;;
-  linux)  OS="unknown-linux-gnu" ;;
-  *)      echo "Unsupported OS: $OS"; exit 1 ;;
+case "$(uname -s)" in
+  Darwin) OS="apple-darwin" ;;
+  Linux) OS="unknown-linux-gnu" ;;
+  *) echo "Unsupported OS: $(uname -s)" >&2; exit 1 ;;
 esac
-
-case "$ARCH" in
-  x86_64|amd64) ARCH="x86_64" ;;
-  arm64|aarch64) ARCH="aarch64" ;;
-  *)             echo "Unsupported architecture: $ARCH"; exit 1 ;;
+case "$(uname -m)" in
+  x86_64 | amd64) ARCH="x86_64" ;;
+  arm64 | aarch64) ARCH="aarch64" ;;
+  *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
+# Must match the asset names produced by .github/workflows/release.yml.
+ASSET="${BIN_NAME}-${ARCH}-${OS}.tar.gz"
 
-TARGET="${ARCH}-${OS}"
-
-# ── Download binary ──────────────────────────────────────────────────────────
-echo "Installing recall for ${TARGET}..."
-
-LATEST=$(curl --proto '=https' --tlsv1.2 -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*"v\(.*\)".*/\1/' 2>/dev/null || echo "")
-if [ -z "$LATEST" ]; then
-  echo "Could not determine latest version. Check https://github.com/${REPO}/releases"
-  exit 1
+if [ "$VERSION" = "latest" ]; then
+  BASE_URL="https://github.com/${REPO}/releases/latest/download"
+else
+  BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
 fi
+# Tests point this at a local directory.
+BASE_URL="${CLAUDE_RESUME_DOWNLOAD_URL:-$BASE_URL}"
 
-URL="https://github.com/${REPO}/releases/download/v${LATEST}/recall-${TARGET}.tar.gz"
-echo "Downloading v${LATEST} from ${URL}..."
-
-mkdir -p "$INSTALL_DIR"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-curl --proto '=https' --tlsv1.2 -fsSL "$URL" -o "${TMP}/recall.tar.gz"
-tar -xzf "${TMP}/recall.tar.gz" -C "$TMP"
-chmod +x "${TMP}/${BIN_NAME}"
-mv "${TMP}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+fetch() {
+  curl --proto '=https,file' --tlsv1.2 -fsSL "$1" -o "$2"
+}
 
-echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
+echo "Downloading ${ASSET} (${VERSION})..."
+fetch "${BASE_URL}/${ASSET}" "${TMP}/${ASSET}"
 
-# ── Check PATH ───────────────────────────────────────────────────────────────
-case ":$PATH:" in
+# Every release publishes a checksum next to each archive; without one, nothing is installed.
+if ! fetch "${BASE_URL}/${ASSET}.sha256" "${TMP}/${ASSET}.sha256" 2>/dev/null; then
+  echo "Could not download ${ASSET}.sha256 to verify the download; nothing was installed." >&2
+  exit 1
+fi
+expected=$(cut -d ' ' -f 1 <"${TMP}/${ASSET}.sha256")
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "${TMP}/${ASSET}" | cut -d ' ' -f 1)
+elif command -v shasum >/dev/null 2>&1; then
+  actual=$(shasum -a 256 "${TMP}/${ASSET}" | cut -d ' ' -f 1)
+else
+  echo "Neither sha256sum nor shasum is available to verify the download." >&2
+  exit 1
+fi
+if [ "$expected" != "$actual" ]; then
+  echo "Checksum mismatch for ${ASSET}: expected ${expected}, got ${actual}" >&2
+  exit 1
+fi
+echo "Checksum verified."
+
+tar -xzf "${TMP}/${ASSET}" -C "$TMP"
+mkdir -p "$INSTALL_DIR"
+cp "${TMP}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}.tmp"
+chmod 755 "${INSTALL_DIR}/${BIN_NAME}.tmp"
+mv -f "${INSTALL_DIR}/${BIN_NAME}.tmp" "${INSTALL_DIR}/${BIN_NAME}"
+echo "Installed $("${INSTALL_DIR}/${BIN_NAME}" --version) to ${INSTALL_DIR}/${BIN_NAME}"
+
+case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *)
     echo ""
-    echo "Add ${INSTALL_DIR} to your PATH:"
-    echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
+    echo "${INSTALL_DIR} is not on your PATH. Add it, for example:"
+    echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.zshrc"
     echo ""
     ;;
 esac
 
-# ── Configure Claude Code ────────────────────────────────────────────────────
-echo "Configuring Claude Code..."
-"${INSTALL_DIR}/${BIN_NAME}" init
-
-echo ""
-echo "Done! Run 'claude-resume' to browse sessions."
+if [ "${CLAUDE_RESUME_NO_INIT:-}" != "1" ]; then
+  "${INSTALL_DIR}/${BIN_NAME}" init
+fi
+echo "Done! Run 'claude-resume' to browse your sessions."
