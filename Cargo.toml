@@ -1,38 +1,55 @@
 [package]
 name = "claude-resume"
-version = "0.4.0"
-edition = "2021"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.89"
 description = "Session finder for Claude Code — search, browse, and resume conversations"
 license = "MIT"
+repository = "https://github.com/mucahitkantepe/claude-resume"
+readme = "README.md"
+keywords = ["claude", "claude-code", "search", "tui", "cli"]
+categories = ["command-line-utilities"]
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "claude-resume"
 path = "src/main.rs"
 
+[features]
+default = ["semantic"]
+# Local embedding model for `-m semantic`. Disable for a smaller, faster build.
+semantic = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+metal = ["semantic", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+accelerate = ["semantic", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ratatui = "0.29"
-crossterm = "0.28"
+anyhow = "1"
 chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
 dirs = "6"
 nucleo-matcher = "0.3"
+ratatui = "0.30"
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
-candle-core = { version = "0.10" }
-candle-nn = { version = "0.10" }
-candle-transformers = { version = "0.10" }
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
-hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: `init` must not reorder the keys of the user's settings.json
+serde_json = { version = "1", features = ["preserve_order"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"], optional = true }
 
 [dev-dependencies]
+assert_cmd = "2"
+libc = "0.2"
+predicates = "3"
 tempfile = "3"
-
-[features]
-default = []
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
 
 [profile.release]
 lto = true

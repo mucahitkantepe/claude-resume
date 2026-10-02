@@ -1,4 +1,5 @@
-# claude-resume demo — recorded with mock data
+# claude-resume demo. Run scripts/record-demo.sh, which builds the binary and the made-up
+# sessions this tape expects in target/demo.
 Output demo.gif
 
 Set FontSize 15
@@ -9,7 +10,10 @@ Set Padding 16
 Set TypingSpeed 60ms
 Set Shell zsh
 
-Env CLAUDE_RESUME_NO_SYNC "1"
+Hide
+Type "export PATH=$PWD/target/release:$PATH CLAUDE_CONFIG_DIR=$PWD/target/demo/.claude CLAUDE_RESUME_NO_SYNC=1 && clear"
+Enter
+Show
 
 # Launch
 Type "claude-resume"
